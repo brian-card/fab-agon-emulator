@@ -4,6 +4,7 @@ pub mod gpio;
 mod gpio_video;
 mod i2c;
 mod mos;
+mod nanoos_prof;
 mod prt_timer;
 mod spi_sdcard;
 mod symbol_map;

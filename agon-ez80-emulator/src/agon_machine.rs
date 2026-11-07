@@ -1531,8 +1531,82 @@ impl AgonMachine {
             self.cycle_counter
                 .set(self.cycle_counter.get().wrapping_add(4));
         } else {
+            crate::nanoos_prof::PROF.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.crash.is_some() {
+                    let sp = cpu.state.reg.get24(Reg16::SP);
+                    if p.record(pc, sp) {
+                        let exports = self.nanoos_raw24(0xffe026);
+                        let fp = exports ^ (self.nanoos_raw24(exports + 3) << 8);
+                        let regs = format!("pc {:06x} sp {:06x} ix {:06x} overlay {:08x}",
+                            pc, sp, cpu.state.reg.get24(Reg16::IX), fp);
+                        p.dump(regs);
+                    }
+                }
+                if p.last_ovl.is_some() && pc >= 0xffe000 && !p.on {
+                    let key = self.nanoos_stack(cpu, pc);
+                    let v = p.last_ovl.as_mut().unwrap();
+                    v.push(key);
+                    if v.len() > 400 {
+                        v.drain(0..200);
+                    }
+                }
+                if p.on {
+                    p.count += 1;
+                    if p.callee_set.contains(&pc) {
+                        *p.callees.entry(pc).or_insert(0) += 1;
+                    }
+                    p.tick += 1;
+                    if p.tick >= 31 {
+                        p.tick = 0;
+                        p.samples += 1;
+                        let key = self.nanoos_stack(cpu, pc);
+                        *p.stacks.entry(key).or_insert(0) += 1;
+                    }
+                }
+            });
             cpu.fast_execute_instruction(self);
         }
+    }
+
+    fn nanoos_raw24(&self, a: u32) -> u32 {
+        let b = |x: u32| -> u32 {
+            if let Some(i) = self.get_internal_ram_address(x) {
+                self.mem_internal[i as usize] as u32
+            } else if let Some(r) = self.get_rom_address(x) {
+                self.mem_rom[r as usize] as u32
+            } else if let Some(e) = self.get_external_ram_address(x) {
+                self.mem_external[e as usize] as u32
+            } else {
+                0
+            }
+        };
+        b(a) | (b(a + 1) << 8) | (b(a + 2) << 16)
+    }
+
+    fn nanoos_stack(&self, cpu: &Cpu, pc: u32) -> String {
+        let mut frames = vec![pc];
+        let mut ix = cpu.state.reg.get24(Reg16::IX);
+        for _ in 0..48 {
+            if ix == 0 || ix >= 0xfffffd {
+                break;
+            }
+            let ret = self.nanoos_raw24(ix + 3);
+            let next = self.nanoos_raw24(ix);
+            frames.push(ret);
+            if next <= ix {
+                break;
+            }
+            ix = next;
+        }
+        let mut fp = 0u32;
+        if frames.iter().any(|&a| a >= 0xffe000) {
+            let exports = self.nanoos_raw24(0xffe026);
+            fp = exports ^ (self.nanoos_raw24(exports + 3) << 8);
+        }
+        frames.iter().rev()
+            .map(|&a| if a >= 0xffe000 { format!("{:06x}#{:08x}", a, fp) } else { format!("{:06x}", a) })
+            .collect::<Vec<_>>().join(";")
     }
 
     #[inline]
@@ -1686,6 +1760,13 @@ impl AgonMachine {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
 
+            if crate::nanoos_prof::PROF.with(|p| p.borrow_mut().poll()) {
+                if let Ok(path) = std::env::var("NANOOS_PROFILE") {
+                    let _ = std::fs::write(format!("{}.ram", path), &self.mem_external[..]);
+                    let _ = std::fs::write(format!("{}.iram", path), &self.mem_internal[..]);
+                    let _ = std::fs::write(format!("{}.uart", path), format!("uart1 ier {:02x}\n", self.uart1.ier));
+                }
+            }
             while timeslice_start.elapsed() < std::time::Duration::from_millis(1) {
                 std::thread::sleep(std::time::Duration::from_micros(500));
             }
